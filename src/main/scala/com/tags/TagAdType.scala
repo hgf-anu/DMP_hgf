@@ -4,6 +4,7 @@ import org.apache.spark.sql.Row
 
 /**
   * 广告位类型标签
+  * App 名称（标签格式： APPxxxx->1）xxxx 为 App 名称，使用缓存文件 appname_dict 进行名称转换；APP 爱奇艺->1
   */
 object TagAdType extends Tag{
 	override def makeTags(args:Any*):List[(String, Int)] ={
