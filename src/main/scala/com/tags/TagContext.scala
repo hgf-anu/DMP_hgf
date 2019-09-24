@@ -1,6 +1,13 @@
 package com.tags
 
+import com.typesafe.config.ConfigFactory
 import com.util.TagUtils
+import org.apache.hadoop.hbase.{HColumnDescriptor, HTableDescriptor, TableName}
+import org.apache.hadoop.hbase.client.{ConnectionFactory, Put}
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapred.TableOutputFormat
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.hadoop.mapred.JobConf
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -24,8 +31,40 @@ object TagContext{
 		//隐式转换
 		import spark.implicits._
 
-		//使用Hbase的准备工作
-		//Hbase创建表对象,列簇
+		//3.1使用Hbase的准备工作[HBASE_API方面还需要加强]
+		// 调用HbaseAPI
+		val load = ConfigFactory.load()
+		// 获取表名
+		val HbaseTableName = load.getString("HBASE.tableName")
+		// 创建Hadoop任务
+		val configuration = spark.sparkContext.hadoopConfiguration
+		// 配置Hbase连接
+		configuration.set("hbase.zookeeper.quorum",load.getString("HBASE.Host"))
+		// 获取connection连接
+		val hbConn = ConnectionFactory.createConnection(configuration)
+		val hbadmin = hbConn.getAdmin
+
+		//3.2Hbase创建表对象,列簇
+		// 判断当前表是否被使用
+		if(!hbadmin.tableExists(TableName.valueOf(HbaseTableName))){
+			println("当前表可用")
+			// 创建表对象
+			val tableDescriptor = new HTableDescriptor(TableName.valueOf(HbaseTableName))
+			// 创建列簇
+			val hColumnDescriptor = new HColumnDescriptor("tags")
+			// 将创建好的列簇加入表中
+			tableDescriptor.addFamily(hColumnDescriptor)
+			hbadmin.createTable(tableDescriptor)
+			hbadmin.close()
+			hbConn.close()
+		}
+		val conf = new JobConf(configuration)
+		// 指定输出类型
+		conf.setOutputFormat(classOf[TableOutputFormat])
+		// 指定输出哪张表
+		conf.set(TableOutputFormat.OUTPUT_TABLE,HbaseTableName)
+
+
 		//1.准备工作
 		//1.1读取数据文件
 		//DataFrame的前身是schemaRDD,可以读取有结构的数据
@@ -56,7 +95,7 @@ object TagContext{
 			val listAd:List[(String, Int)] = TagAdType.makeTags( row )
 
 			//2.1 app名字标签,需要根据app字典转换
-			val listAppname:List[(String, Int)] = TagAppname.makeTags( row,broadcast_app_dict )
+			val listAppname:List[(String, Int)] = TagAppname.makeTags( row, broadcast_app_dict )
 
 			//2.2 商圈标签
 			val listBusiness:List[(String, Int)] = TagBusiness.makeTags( row )
@@ -68,18 +107,25 @@ object TagContext{
 			val listDitch:List[(String, Int)] = TagDitch.makeTags( row )
 
 			//2.5 关键字标签,需要排除黑名单
-			val listKeyword:List[(String, Int)] = TagKeyword.makeTags( row,broadcast_banWords )
+			val listKeyword:List[(String, Int)] = TagKeyword.makeTags( row, broadcast_banWords )
 
 			//2.6 地域标签
 			val listLocation:List[(String, Int)] = TagLocation.makeTags( row )
 
-			(userId,listAd++listAppname++listBusiness++listDevice++listDitch++listKeyword++listLocation)
+			(userId, listAd ++ listAppname ++ listBusiness ++ listDevice ++ listDitch ++ listKeyword ++ listLocation)
 		} )
 		//根据userId进行聚合,df需要转换为rdd.value是List[(,)]类型
-	  	//.rdd.reduceByKey()
-
-		`//3.存入Hbase
-
+		.rdd.reduceByKey( (list1, list2) => {
+			( list1 ::: list2 ).groupBy( _._1 ).mapValues( _.foldLeft[Int]( 0 )( _ + _._2 ) ).toList
+		} )
+		// 4.存入Hbase
+		.map{ case (userId, userTags) => {
+			// 设置rowkey和列、列名
+			val put = new Put( Bytes.toBytes( userId ) )
+			put.addImmutable( Bytes.toBytes( "tags" ), Bytes.toBytes( day ), Bytes.toBytes( userTags.mkString( "," ) ) )
+			(new ImmutableBytesWritable(), put)
+		}
+		       }.saveAsHadoopDataset( conf )
 
 	}
 }
